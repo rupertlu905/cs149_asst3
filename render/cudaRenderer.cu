@@ -14,6 +14,41 @@
 #include "sceneLoader.h"
 #include "util.h"
 
+#include "circleBoxTest.cu_inl"
+
+#include <thrust/scan.h>
+#include <thrust/device_ptr.h>
+#include <thrust/device_malloc.h>
+#include <thrust/device_free.h>
+#include <thrust/scatter.h>
+#include <thrust/reduce.h>
+
+
+#include <thrust/device_vector.h>
+#include <thrust/host_vector.h>
+#include <thrust/scan.h>
+#include <thrust/copy.h>
+#include <thrust/transform.h>
+#include <thrust/count.h>
+
+
+#define DEBUG
+
+#ifdef DEBUG
+#define cudaCheckError(ans) { cudaAssert((ans), __FILE__, __LINE__); }
+inline void cudaAssert(cudaError_t code, const char *file, int line, bool abort=true)
+{
+   if (code != cudaSuccess)
+   {
+      fprintf(stderr, "CUDA Error: %s at %s:%d\n",
+        cudaGetErrorString(code), file, line);
+      if (abort) exit(code);
+   }
+}
+#else
+#define cudaCheckError(ans) ans
+#endif
+
 ////////////////////////////////////////////////////////////////////////////////////////
 // Putting all the cuda kernels here
 ///////////////////////////////////////////////////////////////////////////////////////
@@ -462,6 +497,57 @@ __global__ void kernelRenderPixels() {
 
 }
 
+
+// kernelFlagCircles -- Flags if a circle intersects a given block using circleInBoxConservative
+__global__ void kernelFlagCircles(int* circleFlags, float boxL, float boxR, float boxT, float boxB) {
+    int index = blockIdx.x * blockDim.x + threadIdx.x;
+    if (index >= cuConstRendererParams.numCircles)
+        return;
+
+    int index3 = 3 * index;
+    float3 p = *(float3*)(&cuConstRendererParams.position[index3]);
+    float rad = cuConstRendererParams.radius[index];
+
+    circleFlags[index] = circleInBoxConservative(p.x, p.y, rad, boxL, boxR, boxT, boxB);
+    // if (circleFlags[index] == 1) {
+    //     printf("circle %d intersects with block (%d, %d)\n", index, boxL, boxB);
+    // }
+}
+
+
+__global__ void kernelRenderPixelAllIntersectedCircles(int* circleIndices, int numIntersectedCircles, int blockL, int blockR, int blockT, int blockB) {
+    int pixelX = blockIdx.x * blockDim.x + threadIdx.x + blockL;
+    int pixelY = blockIdx.y * blockDim.y + threadIdx.y + blockB;
+
+    // printf("blockL: %d, blockR: %d, blockT: %d, blockB: %d\n", blockL, blockR, blockT, blockB);
+    if (pixelX < blockL || pixelX >= blockR || pixelY < blockB || pixelY >= blockT) {
+        printf("pixelX: %d, pixelY: %d\n", pixelX, pixelY);
+        return;
+    }
+    // printf("pixelX: %d, pixelY: %d\n", pixelX, pixelY);
+
+    short imageWidth = cuConstRendererParams.imageWidth;
+    short imageHeight = cuConstRendererParams.imageHeight;
+    float invWidth = 1.f / imageWidth;
+    float invHeight = 1.f / imageHeight;
+
+    float2 pixelCenterNorm = make_float2(invWidth * (static_cast<float>(pixelX) + 0.5f),
+                                         invHeight * (static_cast<float>(pixelY) + 0.5f));
+
+    float4* imgPtr = (float4*)(&cuConstRendererParams.imageData[4 * (pixelY * imageWidth + pixelX)]);
+    float4 localImg = *imgPtr;
+
+    for (int i = 0; i < numIntersectedCircles; i++) {
+        int index = circleIndices[i];
+        int index3 = 3 * index;
+        float3 p = *(float3*)(&cuConstRendererParams.position[index3]);
+        shadePixel(index, pixelCenterNorm, p, &localImg);
+    }
+
+    *imgPtr = localImg;
+}
+
+
 ////////////////////////////////////////////////////////////////////////////////////////
 
 
@@ -670,12 +756,75 @@ CudaRenderer::advanceAnimation() {
 
 void
 CudaRenderer::render() {
-    dim3 blockDim(16, 16);
-    dim3 gridDim(
-        (image->width + blockDim.x - 1) / blockDim.x,
-        (image->height + blockDim.y - 1) / blockDim.y
-    );
+    // dim3 blockDim(16, 16);
+    // dim3 gridDim(
+    //     (image->width + blockDim.x - 1) / blockDim.x,
+    //     (image->height + blockDim.y - 1) / blockDim.y
+    // );
 
-    kernelRenderPixels<<<gridDim, blockDim>>>();
-    cudaDeviceSynchronize();
+    // kernelRenderPixels<<<gridDim, blockDim>>>();
+    // cudaDeviceSynchronize();
+
+    // a better implementation:
+    // 1. cut the image into small blocks (e.g., 4x4)
+    // 2. main thread loop through all the blocks
+    // 3. for each block, find the circles that intersect with the block (using flagging and exclusive scan)
+    // 4. for each pixel in the block, loop through the circles that intersect with the block (shade pixel)
+    // 5. update the image using all the blocks
+    // for the procedure above, we need to implement the following kernels: (use thrust if applicable)
+    // 1. kernelFlagCircles
+    // 2. kernelScanCircles
+    // 3. kernelRenderBlock
+    // 4. kernelUpdateImage
+
+    // 1. cut the image into small blocks (e.g., 4x4)
+    int numBlocksX = 4;
+    int numBlocksY = 4;
+    int blockWidth = image->width / numBlocksX;
+    int blockHeight = image->height / numBlocksY;
+
+    // 2. main thread loop through all the blocks
+    for (int blockB = 0; blockB < image->height; blockB+=blockHeight) {
+        for (int blockL = 0; blockL < image->width; blockL+=blockWidth) {
+            // 3. for each block, find the circles that intersect with the block (using flagging and exclusive scan)
+            float invWidth = 1.f / image->width;
+            float invHeight = 1.f / image->height;
+            float boxL = invWidth * (static_cast<float>(blockL));
+            float boxR = invWidth * (static_cast<float>(blockL + blockWidth));
+            float boxT = invHeight * (static_cast<float>(blockB + blockHeight));
+            float boxB = invHeight * (static_cast<float>(blockB));
+            int* circleFlags;
+            cudaMalloc(&circleFlags, sizeof(int) * numCircles);
+            kernelFlagCircles<<<(numCircles + 255) / 256, 256>>>(circleFlags, boxL, boxR, boxT, boxB);
+            cudaDeviceSynchronize();
+
+            thrust::device_ptr<int> circleFlagsInput(circleFlags);
+            int numIntersectedCircles = thrust::reduce(circleFlagsInput, circleFlagsInput + numCircles);
+            // we are using reduce and copy if now to replace exclusive scan and scatter
+            // thrust::device_ptr<int> circleFlagsPrefixSum = thrust::device_malloc<int>(numCircles);
+            // thrust::exclusive_scan(circleFlagsInput, circleFlagsInput + numCircles, circleFlagsPrefixSum);
+            // cudaCheckError(cudaDeviceSynchronize());
+
+            // int numIntersectedCircles;
+            // int lastCircleFlag;
+            // cudaMemcpy(&lastCircleFlag, circleFlags + numCircles - 1, sizeof(int), cudaMemcpyDeviceToHost);
+            // cudaMemcpy(&numIntersectedCircles, circleFlagsPrefixSum.get() + numCircles - 1, sizeof(int), cudaMemcpyDeviceToHost);
+            // numIntersectedCircles += lastCircleFlag;
+            thrust::device_ptr<int> intersectedCircles = thrust::device_malloc<int>(numIntersectedCircles);
+
+            thrust::counting_iterator<int> indices(0);
+            thrust::copy_if(indices, indices + numCircles, circleFlagsInput, intersectedCircles, thrust::identity<int>());
+            cudaCheckError(cudaDeviceSynchronize());
+            thrust::device_free(circleFlagsInput);
+
+            // 4. for each pixel in the block, loop through the circles that intersect with the block (shade pixel)
+            dim3 blockDim(16, 16);
+            dim3 gridDim((blockWidth + blockDim.x - 1) / blockDim.x, (blockHeight + blockDim.y - 1) / blockDim.y);
+            kernelRenderPixelAllIntersectedCircles<<<gridDim, blockDim>>>(intersectedCircles.get(), numIntersectedCircles, blockL, blockL + blockWidth, blockB + blockHeight, blockB);
+            cudaCheckError(cudaDeviceSynchronize());
+            thrust::device_free(intersectedCircles);
+        }
+    }
+
+
 }
