@@ -427,6 +427,41 @@ __global__ void kernelRenderCircles() {
     }
 }
 
+// kernelRenderPixels -- (CUDA device code)
+//
+// Each thread renders a pixel. For each pixel, we iterate over all circles
+// in the order of their index, and accumulate the color contribution from
+// each circle. Update the global memory pixel at the end of the loop.
+__global__ void kernelRenderPixels() {
+
+    int pixelX = blockIdx.x * blockDim.x + threadIdx.x;
+    int pixelY = blockIdx.y * blockDim.y + threadIdx.y;
+
+    short imageWidth = cuConstRendererParams.imageWidth;
+    short imageHeight = cuConstRendererParams.imageHeight;
+
+    if (pixelX >= imageWidth || pixelY >= imageHeight)
+        return;
+
+    float invWidth = 1.f / imageWidth;
+    float invHeight = 1.f / imageHeight;
+
+    float2 pixelCenterNorm = make_float2(invWidth * (static_cast<float>(pixelX) + 0.5f),
+                                         invHeight * (static_cast<float>(pixelY) + 0.5f));
+
+    float4* imgPtr = (float4*)(&cuConstRendererParams.imageData[4 * (pixelY * imageWidth + pixelX)]);
+    float4 localImg = *imgPtr;
+
+    for (int index=0; index<cuConstRendererParams.numCircles; index++) {
+        int index3 = 3 * index;
+        float3 p = *(float3*)(&cuConstRendererParams.position[index3]);
+        shadePixel(index, pixelCenterNorm, p, &localImg);
+    }
+
+    *imgPtr = localImg;
+
+}
+
 ////////////////////////////////////////////////////////////////////////////////////////
 
 
@@ -635,11 +670,12 @@ CudaRenderer::advanceAnimation() {
 
 void
 CudaRenderer::render() {
+    dim3 blockDim(16, 16);
+    dim3 gridDim(
+        (image->width + blockDim.x - 1) / blockDim.x,
+        (image->height + blockDim.y - 1) / blockDim.y
+    );
 
-    // 256 threads per block is a healthy number
-    dim3 blockDim(256, 1);
-    dim3 gridDim((numCircles + blockDim.x - 1) / blockDim.x);
-
-    kernelRenderCircles<<<gridDim, blockDim>>>();
+    kernelRenderPixels<<<gridDim, blockDim>>>();
     cudaDeviceSynchronize();
 }
