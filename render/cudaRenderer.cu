@@ -16,21 +16,6 @@
 
 #include "circleBoxTest.cu_inl"
 
-#include <thrust/scan.h>
-#include <thrust/device_ptr.h>
-#include <thrust/device_malloc.h>
-#include <thrust/device_free.h>
-#include <thrust/scatter.h>
-#include <thrust/reduce.h>
-
-
-#include <thrust/device_vector.h>
-#include <thrust/host_vector.h>
-#include <thrust/scan.h>
-#include <thrust/copy.h>
-#include <thrust/transform.h>
-#include <thrust/count.h>
-
 // Standard C++ headers
 #include <vector>               // For std::vector
 #include <algorithm>            // For std::min and std::max if used elsewhere
@@ -40,37 +25,10 @@
 #include <cuda_runtime.h>       // Core CUDA runtime API
 #include <cuda.h>               // CUDA driver API (optional, if needed)
 
-// Thrust headers
-#include <thrust/device_ptr.h>                  // For thrust::device_ptr
-#include <thrust/tabulate.h>                    // For thrust::tabulate
-#include <thrust/copy.h>                        // For thrust::copy_if
-#include <thrust/remove.h>                      // For thrust::remove_copy_if
-#include <thrust/functional.h>                  // For thrust::identity
-#include <thrust/iterator/counting_iterator.h>  // For thrust::counting_iterator
-#include <thrust/reduce.h>                      // For thrust::reduce
-#include <thrust/device_malloc.h>               // For thrust::device_malloc
-#include <thrust/device_free.h>                 // For thrust::device_free
-#include <thrust/execution_policy.h>
-
-#include "exclusiveScan.cu_inl" 
-#define STEP 32
 #define SCAN_BLOCK_DIM 1024
-#define DEBUG
+#include "exclusiveScan.cu_inl" 
 
-#ifdef DEBUG
-#define cudaCheckError(ans) { cudaAssert((ans), __FILE__, __LINE__); }
-inline void cudaAssert(cudaError_t code, const char *file, int line, bool abort=true)
-{
-   if (code != cudaSuccess)
-   {
-      fprintf(stderr, "CUDA Error: %s at %s:%d\n",
-        cudaGetErrorString(code), file, line);
-      if (abort) exit(code);
-   }
-}
-#else
-#define cudaCheckError(ans) ans
-#endif
+#define STEP 32
 
 ////////////////////////////////////////////////////////////////////////////////////////
 // Putting all the cuda kernels here
@@ -437,53 +395,6 @@ shadePixel(int circleIndex, float2 pixelCenter, float3 p, float4* imagePtr) {
     // END SHOULD-BE-ATOMIC REGION
 }
 
-// kernelRenderCircles -- (CUDA device code)
-//
-// Each thread renders a circle.  Since there is no protection to
-// ensure order of update or mutual exclusion on the output image, the
-// resulting image will be incorrect.
-__global__ void kernelRenderCircles() {
-
-    int index = blockIdx.x * blockDim.x + threadIdx.x;
-
-    if (index >= cuConstRendererParams.numCircles)
-        return;
-
-    int index3 = 3 * index;
-
-    // read position and radius
-    float3 p = *(float3*)(&cuConstRendererParams.position[index3]);
-    float  rad = cuConstRendererParams.radius[index];
-
-    // compute the bounding box of the circle. The bound is in integer
-    // screen coordinates, so it's clamped to the edges of the screen.
-    short imageWidth = cuConstRendererParams.imageWidth;
-    short imageHeight = cuConstRendererParams.imageHeight;
-    short minX = static_cast<short>(imageWidth * (p.x - rad));
-    short maxX = static_cast<short>(imageWidth * (p.x + rad)) + 1;
-    short minY = static_cast<short>(imageHeight * (p.y - rad));
-    short maxY = static_cast<short>(imageHeight * (p.y + rad)) + 1;
-
-    // a bunch of clamps.  Is there a CUDA built-in for this?
-    short screenMinX = (minX > 0) ? ((minX < imageWidth) ? minX : imageWidth) : 0;
-    short screenMaxX = (maxX > 0) ? ((maxX < imageWidth) ? maxX : imageWidth) : 0;
-    short screenMinY = (minY > 0) ? ((minY < imageHeight) ? minY : imageHeight) : 0;
-    short screenMaxY = (maxY > 0) ? ((maxY < imageHeight) ? maxY : imageHeight) : 0;
-
-    float invWidth = 1.f / imageWidth;
-    float invHeight = 1.f / imageHeight;
-
-    // for all pixels in the bonding box
-    for (int pixelY=screenMinY; pixelY<screenMaxY; pixelY++) {
-        float4* imgPtr = (float4*)(&cuConstRendererParams.imageData[4 * (pixelY * imageWidth + screenMinX)]);
-        for (int pixelX=screenMinX; pixelX<screenMaxX; pixelX++) {
-            float2 pixelCenterNorm = make_float2(invWidth * (static_cast<float>(pixelX) + 0.5f),
-                                                 invHeight * (static_cast<float>(pixelY) + 0.5f));
-            shadePixel(index, pixelCenterNorm, p, imgPtr);
-            imgPtr++;
-        }
-    }
-}
 
 __global__ void kernelRenderPixels(int batch) {
     int blockL = blockIdx.x * blockDim.x;
@@ -524,8 +435,6 @@ __global__ void kernelRenderPixels(int batch) {
         if (batch_index == batch - 1) {
             numCircleIntersected = sOutput[batch_index] + circleFlags[batch_index];
         }
-        __syncthreads();
-
         if (circleFlags[batch_index] == 1) {
             circleIntersected[sOutput[batch_index]] = circleIndex;
         }
@@ -549,92 +458,6 @@ __global__ void kernelRenderPixels(int batch) {
     }
 }
 
-
-// kernelFlagCircles -- Flags if a circle intersects a given block using circleInBoxConservative
-__global__ void kernelFlagCircles(int* circleFlags, float boxL, float boxR, float boxT, float boxB) {
-    int index = blockIdx.x * blockDim.x + threadIdx.x;
-    if (index >= cuConstRendererParams.numCircles)
-        return;
-
-    int index3 = 3 * index;
-    float3 p = *(float3*)(&cuConstRendererParams.position[index3]);
-    float rad = cuConstRendererParams.radius[index];
-
-    circleFlags[index] = circleInBoxConservative(p.x, p.y, rad, boxL, boxR, boxT, boxB);
-    // if (circleFlags[index] == 1) {
-    //     printf("circle %d intersects with block (%d, %d)\n", index, boxL, boxB);
-    // }
-}
-
-
-__global__ void kernelRenderPixelAllIntersectedCircles(int* circleIndices, int numIntersectedCircles, int blockL, int blockR, int blockT, int blockB) {
-    int pixelX = blockIdx.x * blockDim.x + threadIdx.x + blockL;
-    int pixelY = blockIdx.y * blockDim.y + threadIdx.y + blockB;
-
-    // printf("blockL: %d, blockR: %d, blockT: %d, blockB: %d\n", blockL, blockR, blockT, blockB);
-    if (pixelX < blockL || pixelX >= blockR || pixelY < blockB || pixelY >= blockT) {
-        printf("pixelX: %d, pixelY: %d\n", pixelX, pixelY);
-        return;
-    }
-    // printf("pixelX: %d, pixelY: %d\n", pixelX, pixelY);
-
-    short imageWidth = cuConstRendererParams.imageWidth;
-    short imageHeight = cuConstRendererParams.imageHeight;
-    float invWidth = 1.f / imageWidth;
-    float invHeight = 1.f / imageHeight;
-
-    float2 pixelCenterNorm = make_float2(invWidth * (static_cast<float>(pixelX) + 0.5f),
-                                         invHeight * (static_cast<float>(pixelY) + 0.5f));
-
-    float4* imgPtr = (float4*)(&cuConstRendererParams.imageData[4 * (pixelY * imageWidth + pixelX)]);
-    float4 localImg = *imgPtr;
-
-    for (int i = 0; i < numIntersectedCircles; i++) {
-        int index = circleIndices[i];
-        int index3 = 3 * index;
-        float3 p = *(float3*)(&cuConstRendererParams.position[index3]);
-        shadePixel(index, pixelCenterNorm, p, &localImg);
-    }
-
-    *imgPtr = localImg;
-}
-
-__global__ void kernelRenderPixelBoxes(int* intersectedCirclesBoxes, int* numIntersectedCirclesBoxes, int numBlocksX, int numBlocksY) {
-    int pixelX = blockIdx.x * blockDim.x + threadIdx.x;
-    int pixelY = blockIdx.y * blockDim.y + threadIdx.y;
-
-    short imageWidth = cuConstRendererParams.imageWidth;
-    short imageHeight = cuConstRendererParams.imageHeight;
-
-    if (pixelX >= imageWidth || pixelY >= imageHeight) {
-        return;
-    }
-
-    int boxRow = pixelY / (imageHeight / numBlocksY);
-    int boxCol = pixelX / (imageWidth / numBlocksX);
-    int boxIdx = boxRow * numBlocksX + boxCol;
-
-    float invWidth = 1.f / imageWidth;
-    float invHeight = 1.f / imageHeight;
-
-    float2 pixelCenterNorm = make_float2(invWidth * (static_cast<float>(pixelX) + 0.5f),
-                                         invHeight * (static_cast<float>(pixelY) + 0.5f));
-
-    float4* imgPtr = (float4*)(&cuConstRendererParams.imageData[4 * (pixelY * imageWidth + pixelX)]);
-    float4 localImg = *imgPtr;
-
-    int* intersectedCircles = intersectedCirclesBoxes + boxIdx * cuConstRendererParams.numCircles;
-    int numIntersectedCircles = numIntersectedCirclesBoxes[boxIdx];
-
-    for (int i = 0; i < numIntersectedCircles; i++) {
-        int index = intersectedCircles[i];
-        int index3 = 3 * index;
-        float3 p = *(float3*)(&cuConstRendererParams.position[index3]);
-        shadePixel(index, pixelCenterNorm, p, &localImg);
-    }
-
-    *imgPtr = localImg;
-}
 
 ////////////////////////////////////////////////////////////////////////////////////////
 
@@ -841,65 +664,6 @@ CudaRenderer::advanceAnimation() {
     }
     cudaDeviceSynchronize();
 }
-
-// Define the functor
-struct CircleBoxIntersectFunctor {
-    int numCircles;
-    int numSplitsX;
-    int numSplitsY;
-    float* circlePosition;
-    float* circleR;
-
-    __host__ __device__
-    CircleBoxIntersectFunctor(int numCircles, int numSplitsX, int numSplitsY, float* circlePosition, float* circleR)
-        : numCircles(numCircles), numSplitsX(numSplitsX), numSplitsY(numSplitsY), 
-          circlePosition(circlePosition), circleR(circleR) {}
-
-    __host__ __device__
-    int operator()(int idx) const {
-        // Determine the box and circle indices
-        int boxIdx = idx / numCircles;
-        int circleIdx = idx % numCircles;
-
-        // Calculate column and row based on box index
-        int col = boxIdx % numSplitsX;
-        int row = boxIdx / numSplitsX;
-
-        // Calculate step sizes
-        float step_size_x = 1.0f / static_cast<float>(numSplitsX);
-        float step_size_y = 1.0f / static_cast<float>(numSplitsY);
-
-        // Compute box boundaries
-        float boxL = col * step_size_x;
-        float boxR = (col + 1) * step_size_x;
-        float boxT = (row + 1) * step_size_y;
-        float boxB = row * step_size_y;
-
-        // Retrieve circle position and radius
-        float cX = circlePosition[3 * circleIdx];
-        float cY = circlePosition[3 * circleIdx + 1];
-        float cR = circleR[circleIdx];
-
-        // Check if the circle intersects the box
-        if (cX >= (boxL - cR) &&
-            cX <= (boxR + cR) &&
-            cY >= (boxB - cR) &&
-            cY <= (boxT + cR)) {
-            return 1;
-        } else {
-            return 0;
-        }
-    }
-};
-
-struct is_zero {
-    __host__ __device__
-    bool operator()(int x)
-    {
-        return x == 0;
-    }
-};
-
 
 void CudaRenderer::render() {
     // spin a kernel per pixel 
