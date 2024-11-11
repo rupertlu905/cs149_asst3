@@ -44,7 +44,7 @@
 // __shared__ uint prefixSumScratch[2 * BLOCKSIZE];
 // sharedMemExclusiveScan(linearThreadIndex, prefixSumInput, prefixSumOutput, prefixSumScratch, BLOCKSIZE);
 
-
+#define SCAN_BLOCK_DIM 1024
 #define LOG2_WARP_SIZE 5U
 #define WARP_SIZE (1U << LOG2_WARP_SIZE)
 

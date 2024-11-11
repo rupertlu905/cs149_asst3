@@ -52,7 +52,9 @@
 #include <thrust/device_free.h>                 // For thrust::device_free
 #include <thrust/execution_policy.h>
 
-
+#include "exclusiveScan.cu_inl" 
+#define STEP 32
+#define SCAN_BLOCK_DIM 1024
 #define DEBUG
 
 #ifdef DEBUG
@@ -483,39 +485,68 @@ __global__ void kernelRenderCircles() {
     }
 }
 
-// kernelRenderPixels -- (CUDA device code)
-//
-// Each thread renders a pixel. For each pixel, we iterate over all circles
-// in the order of their index, and accumulate the color contribution from
-// each circle. Update the global memory pixel at the end of the loop.
-__global__ void kernelRenderPixels() {
-
-    int pixelX = blockIdx.x * blockDim.x + threadIdx.x;
-    int pixelY = blockIdx.y * blockDim.y + threadIdx.y;
-
-    short imageWidth = cuConstRendererParams.imageWidth;
-    short imageHeight = cuConstRendererParams.imageHeight;
-
-    if (pixelX >= imageWidth || pixelY >= imageHeight)
+__global__ void kernelRenderPixels(int batch) {
+    int blockL = blockIdx.x * blockDim.x;
+    int blockB = blockIdx.y * blockDim.y;
+    int imageWidth = cuConstRendererParams.imageWidth;
+    int imageHeight = cuConstRendererParams.imageHeight;
+    if (blockL >= imageWidth || blockB >= imageHeight)
         return;
 
+    int numCircles = cuConstRendererParams.numCircles;
+    int pixelX = blockL + threadIdx.x;
+    int pixelY = blockB + threadIdx.y;
     float invWidth = 1.f / imageWidth;
     float invHeight = 1.f / imageHeight;
+    float boxL = invWidth * static_cast<float>(blockL);
+    float boxR = invWidth * static_cast<float>(blockL + blockDim.x);
+    float boxT = invHeight * static_cast<float>(blockB + blockDim.y);
+    float boxB = invHeight * static_cast<float>(blockB);
+    int batch_index = threadIdx.x + blockDim.x * threadIdx.y;
 
-    float2 pixelCenterNorm = make_float2(invWidth * (static_cast<float>(pixelX) + 0.5f),
-                                         invHeight * (static_cast<float>(pixelY) + 0.5f));
+    __shared__ uint circleFlags[SCAN_BLOCK_DIM];
+    __shared__ uint sScratch[2 * SCAN_BLOCK_DIM];
+    __shared__ uint sOutput[SCAN_BLOCK_DIM];
+    __shared__ uint numCircleIntersected;
+    __shared__ uint circleIntersected[SCAN_BLOCK_DIM];
 
-    float4* imgPtr = (float4*)(&cuConstRendererParams.imageData[4 * (pixelY * imageWidth + pixelX)]);
-    float4 localImg = *imgPtr;
+    for (int batch_begin = 0; batch_begin < numCircles; batch_begin += batch) {
+        // should we make the > numCircle ones return early?
+        int circleIndex = batch_begin + batch_index;
+        float3 p = *(float3*)(&cuConstRendererParams.position[3 * circleIndex]);
+        float rad = cuConstRendererParams.radius[circleIndex];
+        circleFlags[batch_index] = circleInBoxConservative(p.x, p.y, rad, boxL, boxR, boxT, boxB);
+        __syncthreads();
 
-    for (int index=0; index<cuConstRendererParams.numCircles; index++) {
-        int index3 = 3 * index;
-        float3 p = *(float3*)(&cuConstRendererParams.position[index3]);
-        shadePixel(index, pixelCenterNorm, p, &localImg);
+        sharedMemExclusiveScan(batch_index, circleFlags, sOutput, sScratch, batch);
+        __syncthreads();
+
+        if (batch_index == batch - 1) {
+            numCircleIntersected = sOutput[batch_index] + circleFlags[batch_index];
+        }
+        __syncthreads();
+
+        if (circleFlags[batch_index] == 1) {
+            circleIntersected[sOutput[batch_index]] = circleIndex;
+        }
+        __syncthreads();
+
+        // render circles on the pixel sequentially
+        int pixel = pixelY * imageWidth + pixelX;
+        float2 pixelCenterNorm = make_float2(invWidth * (static_cast<float>(pixelX) + 0.5f),
+                                             invHeight * (static_cast<float>(pixelY) + 0.5f));
+        float4* imgPtr = (float4*)(&cuConstRendererParams.imageData[4 * pixel]);
+        float4 localImg = *imgPtr;
+
+        for (int i = 0; i < numCircleIntersected; i++) {
+            int index = circleIntersected[i];
+            int index3 = 3 * index;
+            float3 p = *(float3*)(&cuConstRendererParams.position[index3]);
+            shadePixel(index, pixelCenterNorm, p, &localImg);
+        }
+
+        *imgPtr = localImg;
     }
-
-    *imgPtr = localImg;
-
 }
 
 
@@ -604,7 +635,6 @@ __global__ void kernelRenderPixelBoxes(int* intersectedCirclesBoxes, int* numInt
 
     *imgPtr = localImg;
 }
-
 
 ////////////////////////////////////////////////////////////////////////////////////////
 
@@ -872,71 +902,14 @@ struct is_zero {
 
 
 void CudaRenderer::render() {
-    // 1. Cut the image into small blocks (e.g., 4x4)
-    int numBlocksX, numBlocksY;
-    if (numCircles < 2000) {
-        numBlocksX = 2;
-        numBlocksY = 2;
-    } else {
-        numBlocksX = 8;
-        numBlocksY = 8;
-    }
-    int numBoxes = numBlocksX * numBlocksY;
-    printf("Number of circles: %d\n", numCircles);
-
-    // Allocate circle flags array
-    int totalFlags = numCircles * numBoxes;
-    int* circleFlags;
-    cudaMalloc(&circleFlags, sizeof(int) * totalFlags);
-    cudaMemset(circleFlags, 0, sizeof(int) * totalFlags);
-
-    // Set up the functor and call thrust::tabulate
-    CircleBoxIntersectFunctor functor(numCircles, numBlocksX, numBlocksY, cudaDevicePosition, cudaDeviceRadius);
-
-    thrust::device_ptr<int> circleFlagsPtr(circleFlags);
-    thrust::tabulate(thrust::device, circleFlagsPtr, circleFlagsPtr + totalFlags, functor);
-
-    // Allocate intersectedCircles array
-    int* intersectedCircles;
-    cudaMalloc(&intersectedCircles, sizeof(int) * totalFlags);
-    // Allocate array to store the number of intersected circles per box
-    int* numIntersectedCircles = new int[numBoxes];
-
-    // For each box, extract intersected circles
-    // int numIntersectedCircles[numBoxes];
-    for (int boxIdx = 0; boxIdx < numBoxes; boxIdx++) {
-        int* boxCircleFlags = circleFlags + boxIdx * numCircles;
-        int* boxIntersectedCircles = intersectedCircles + boxIdx * numCircles;
-
-        thrust::device_ptr<int> boxCircleFlagsPtr(boxCircleFlags);
-        thrust::device_ptr<int> boxIntersectedCirclesPtr(boxIntersectedCircles);
-
-        thrust::counting_iterator<int> circleIndices(0);
-
-        // Use remove_copy_if to copy indices where flag != 0
-        auto endPtr = thrust::remove_copy_if(
-            circleIndices,
-            circleIndices + numCircles,
-            boxCircleFlagsPtr,
-            boxIntersectedCirclesPtr,
-            is_zero()
-        );
-
-        // Calculate the number of intersected circles for this box
-        int count = endPtr - boxIntersectedCirclesPtr;
-        numIntersectedCircles[boxIdx] = count;
-    }
-
-    // Proceed with shading pixels using intersectedCircles...
-    int* numIntersectedCirclesCuda;
-    cudaMalloc(&numIntersectedCirclesCuda, sizeof(int) * numBoxes);
-    cudaMemcpy(numIntersectedCirclesCuda, numIntersectedCircles, sizeof(int) * numBoxes, cudaMemcpyHostToDevice);
-    dim3 blockDim(16, 16);
+    // spin a kernel per pixel 
+    // keep a 32*32 block of the frame in the same thread block
+    // for each kernel, loop through batches of circles
+    dim3 blockDim(STEP, STEP);
     dim3 gridDim(
         (image->width + blockDim.x - 1) / blockDim.x,
         (image->height + blockDim.y - 1) / blockDim.y
     );
-    kernelRenderPixelBoxes<<<gridDim, blockDim>>>(intersectedCircles, numIntersectedCirclesCuda, numBlocksX, numBlocksY);
-
-    cudaCheckError(cudaDeviceSynchronize());
+    kernelRenderPixels<<<gridDim, blockDim>>>(SCAN_BLOCK_DIM);
+    cudaDeviceSynchronize();
 }
