@@ -396,7 +396,7 @@ shadePixel(int circleIndex, float2 pixelCenter, float3 p, float4* imagePtr) {
 }
 
 
-__global__ void kernelRenderPixels(int batch) {
+__global__ void kernelRenderPixels() {
     int blockL = blockIdx.x * blockDim.x;
     int blockB = blockIdx.y * blockDim.y;
     int imageWidth = cuConstRendererParams.imageWidth;
@@ -421,7 +421,13 @@ __global__ void kernelRenderPixels(int batch) {
     __shared__ uint numCircleIntersected;
     __shared__ uint circleIntersected[SCAN_BLOCK_DIM];
 
-    for (int batch_begin = 0; batch_begin < numCircles; batch_begin += batch) {
+    int pixel = pixelY * imageWidth + pixelX;
+    float2 pixelCenterNorm = make_float2(invWidth * (static_cast<float>(pixelX) + 0.5f),
+                                         invHeight * (static_cast<float>(pixelY) + 0.5f));
+    float4* imgPtr = (float4*)(&cuConstRendererParams.imageData[4 * pixel]);
+    float4 localImg = *imgPtr;
+
+    for (int batch_begin = 0; batch_begin < numCircles; batch_begin += SCAN_BLOCK_DIM) {
         // should we make the > numCircle ones return early?
         int circleIndex = batch_begin + batch_index;
         float3 p = *(float3*)(&cuConstRendererParams.position[3 * circleIndex]);
@@ -429,10 +435,10 @@ __global__ void kernelRenderPixels(int batch) {
         circleFlags[batch_index] = circleInBoxConservative(p.x, p.y, rad, boxL, boxR, boxT, boxB);
         __syncthreads();
 
-        sharedMemExclusiveScan(batch_index, circleFlags, sOutput, sScratch, batch);
+        sharedMemExclusiveScan(batch_index, circleFlags, sOutput, sScratch, SCAN_BLOCK_DIM);
         __syncthreads();
 
-        if (batch_index == batch - 1) {
+        if (batch_index == SCAN_BLOCK_DIM - 1) {
             numCircleIntersected = sOutput[batch_index] + circleFlags[batch_index];
         }
         if (circleFlags[batch_index] == 1) {
@@ -441,21 +447,14 @@ __global__ void kernelRenderPixels(int batch) {
         __syncthreads();
 
         // render circles on the pixel sequentially
-        int pixel = pixelY * imageWidth + pixelX;
-        float2 pixelCenterNorm = make_float2(invWidth * (static_cast<float>(pixelX) + 0.5f),
-                                             invHeight * (static_cast<float>(pixelY) + 0.5f));
-        float4* imgPtr = (float4*)(&cuConstRendererParams.imageData[4 * pixel]);
-        float4 localImg = *imgPtr;
-
         for (int i = 0; i < numCircleIntersected; i++) {
             int index = circleIntersected[i];
             int index3 = 3 * index;
             float3 p = *(float3*)(&cuConstRendererParams.position[index3]);
             shadePixel(index, pixelCenterNorm, p, &localImg);
         }
-
-        *imgPtr = localImg;
     }
+    *imgPtr = localImg;
 }
 
 
@@ -674,6 +673,6 @@ void CudaRenderer::render() {
         (image->width + blockDim.x - 1) / blockDim.x,
         (image->height + blockDim.y - 1) / blockDim.y
     );
-    kernelRenderPixels<<<gridDim, blockDim>>>(SCAN_BLOCK_DIM);
+    kernelRenderPixels<<<gridDim, blockDim>>>();
     cudaDeviceSynchronize();
 }
