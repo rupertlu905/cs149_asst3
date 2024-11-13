@@ -510,7 +510,8 @@ __global__ void kernelRenderPixelsIterative() {
     float4 localImg = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
 
     int count = 1;
-    int countmax = 20;
+    int countmax = 7;
+    __shared__ bool block_all_done;
     for (int batch_begin = numCircles - 1; batch_begin >= 0; batch_begin -= SCAN_BLOCK_DIM) {
         // should we make the > numCircle ones return early?
         int circleIndex = batch_begin - batch_index;
@@ -531,6 +532,7 @@ __global__ void kernelRenderPixelsIterative() {
         }
         if (circleFlags[batch_index] == 1) {
             circleIntersected[sOutput[batch_index]] = circleIndex;
+            block_all_done = true;
         }
         __syncthreads();
 
@@ -544,7 +546,11 @@ __global__ void kernelRenderPixelsIterative() {
             count = shadePixelIterative(index, pixelCenterNorm, p, &localImg, count);
         }
 
-        // if (count > countmax) break;
+        if (count <= countmax) {
+            block_all_done = false;
+        }
+        __syncthreads();
+        if (block_all_done) break; 
     }
 
     if (count > countmax) {
