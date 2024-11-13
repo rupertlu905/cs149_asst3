@@ -352,30 +352,16 @@ shadePixel(int circleIndex, float2 pixelCenter, float3 p, float4* imagePtr) {
 
     // there is a non-zero contribution.  Now compute the shading value
 
-    // suggestion: This conditional is in the inner loop.  Although it
-    // will evaluate the same for all threads, there is overhead in
-    // setting up the lane masks etc to implement the conditional.  It
-    // would be wise to perform this logic outside of the loop next in
-    // kernelRenderCircles.  (If feeling good about yourself, you
-    // could use some specialized template magic).
-    if (cuConstRendererParams.sceneName == SNOWFLAKES || cuConstRendererParams.sceneName == SNOWFLAKES_SINGLE_FRAME) {
+    const float kCircleMaxAlpha = .5f;
+    const float falloffScale = 4.f;
 
-        const float kCircleMaxAlpha = .5f;
-        const float falloffScale = 4.f;
+    float normPixelDist = sqrt(pixelDist) / rad;
+    rgb = lookupColor(normPixelDist);
 
-        float normPixelDist = sqrt(pixelDist) / rad;
-        rgb = lookupColor(normPixelDist);
+    float maxAlpha = .6f + .4f * (1.f-p.z);
+    maxAlpha = kCircleMaxAlpha * fmaxf(fminf(maxAlpha, 1.f), 0.f); // kCircleMaxAlpha * clamped value
+    alpha = maxAlpha * exp(-1.f * falloffScale * normPixelDist * normPixelDist);
 
-        float maxAlpha = .6f + .4f * (1.f-p.z);
-        maxAlpha = kCircleMaxAlpha * fmaxf(fminf(maxAlpha, 1.f), 0.f); // kCircleMaxAlpha * clamped value
-        alpha = maxAlpha * exp(-1.f * falloffScale * normPixelDist * normPixelDist);
-
-    } else {
-        // simple: each circle has an assigned color
-        int index3 = 3 * circleIndex;
-        rgb = *(float3*)&(cuConstRendererParams.color[index3]);
-        alpha = .5f;
-    }
 
     float oneMinusAlpha = 1.f - alpha;
 
@@ -391,6 +377,40 @@ shadePixel(int circleIndex, float2 pixelCenter, float3 p, float4* imagePtr) {
 
     // global memory write
     *imagePtr = newColor;
+
+    // END SHOULD-BE-ATOMIC REGION
+}
+
+
+__device__ __inline__ int
+shadePixelIterative(int circleIndex, float2 pixelCenter, float3 p, float4* imagePtr, int count) {
+
+    float diffX = p.x - pixelCenter.x;
+    float diffY = p.y - pixelCenter.y;
+    float pixelDist = diffX * diffX + diffY * diffY;
+
+    float rad = cuConstRendererParams.radius[circleIndex];;
+    float maxDist = rad * rad;
+
+    // circle does not contribute to the image
+    if (pixelDist > maxDist)
+        return count;
+
+    // there is a non-zero contribution.  Now compute the shading value
+    
+    // simple: each circle has an assigned color
+    int index3 = 3 * circleIndex;
+    float3 rgb = *(float3*)&(cuConstRendererParams.color[index3]);
+
+    // BEGIN SHOULD-BE-ATOMIC REGION
+    // global memory read
+
+    float factor = __powf(0.5, count);
+    imagePtr->x += factor * rgb.x;
+    imagePtr->y += factor * rgb.y;
+    imagePtr->z += factor * rgb.z;
+
+    return count + 1;
 
     // END SHOULD-BE-ATOMIC REGION
 }
@@ -455,6 +475,87 @@ __global__ void kernelRenderPixels() {
         }
     }
     *imgPtr = localImg;
+}
+
+
+__global__ void kernelRenderPixelsIterative() {
+    int blockL = blockIdx.x * blockDim.x;
+    int blockB = blockIdx.y * blockDim.y;
+    int imageWidth = cuConstRendererParams.imageWidth;
+    int imageHeight = cuConstRendererParams.imageHeight;
+    // if (blockL >= imageWidth || blockB >= imageHeight)
+    //     return;
+
+    int numCircles = cuConstRendererParams.numCircles;
+    int pixelX = blockL + threadIdx.x;
+    int pixelY = blockB + threadIdx.y;
+    float invWidth = 1.f / imageWidth;
+    float invHeight = 1.f / imageHeight;
+    float boxL = invWidth * static_cast<float>(blockL);
+    float boxR = invWidth * static_cast<float>(blockL + blockDim.x);
+    float boxT = invHeight * static_cast<float>(blockB + blockDim.y);
+    float boxB = invHeight * static_cast<float>(blockB);
+    int batch_index = threadIdx.x + blockDim.x * threadIdx.y;
+
+    __shared__ uint circleFlags[SCAN_BLOCK_DIM];
+    __shared__ uint sScratch[2 * SCAN_BLOCK_DIM];
+    __shared__ uint sOutput[SCAN_BLOCK_DIM];
+    __shared__ uint numCircleIntersected;
+    __shared__ uint circleIntersected[SCAN_BLOCK_DIM];
+
+    int pixel = pixelY * imageWidth + pixelX;
+    float2 pixelCenterNorm = make_float2(invWidth * (static_cast<float>(pixelX) + 0.5f),
+                                         invHeight * (static_cast<float>(pixelY) + 0.5f));
+    float4* imgPtr = (float4*)(&cuConstRendererParams.imageData[4 * pixel]);
+    float4 localImg = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+
+    int count = 1;
+    int countmax = 20;
+    for (int batch_begin = numCircles - 1; batch_begin >= 0; batch_begin -= SCAN_BLOCK_DIM) {
+        // should we make the > numCircle ones return early?
+        int circleIndex = batch_begin - batch_index;
+        if (circleIndex < 0) {
+            circleFlags[batch_index] = 0;
+        } else {
+            float3 p = *(float3*)(&cuConstRendererParams.position[3 * circleIndex]);
+            float rad = cuConstRendererParams.radius[circleIndex];
+            circleFlags[batch_index] = circleInBoxConservative(p.x, p.y, rad, boxL, boxR, boxT, boxB);
+        }
+        __syncthreads();
+
+        sharedMemExclusiveScan(batch_index, circleFlags, sOutput, sScratch, SCAN_BLOCK_DIM);
+        __syncthreads();
+
+        if (batch_index == SCAN_BLOCK_DIM - 1) {
+            numCircleIntersected = sOutput[batch_index] + circleFlags[batch_index];
+        }
+        if (circleFlags[batch_index] == 1) {
+            circleIntersected[sOutput[batch_index]] = circleIndex;
+        }
+        __syncthreads();
+
+        // render circles on the pixel sequentially
+        for (int i = 0; i < numCircleIntersected; i++) {
+            if (count > countmax)
+                break;
+            int index = circleIntersected[i];
+            int index3 = 3 * index;
+            float3 p = *(float3*)(&cuConstRendererParams.position[index3]);
+            count = shadePixelIterative(index, pixelCenterNorm, p, &localImg, count);
+        }
+
+        // if (count > countmax) break;
+    }
+
+    if (count > countmax) {
+        *imgPtr = localImg;
+    } else {
+        count--;
+        float factor = __powf(0.5, count);
+        imgPtr->x = imgPtr->x * factor + localImg.x;
+        imgPtr->y = imgPtr->y * factor + localImg.y;
+        imgPtr->z = imgPtr->z * factor + localImg.z;
+    }
 }
 
 
@@ -673,6 +774,10 @@ void CudaRenderer::render() {
         (image->width + blockDim.x - 1) / blockDim.x,
         (image->height + blockDim.y - 1) / blockDim.y
     );
-    kernelRenderPixels<<<gridDim, blockDim>>>();
+    if (sceneName == SNOWFLAKES || sceneName == SNOWFLAKES_SINGLE_FRAME) {
+        kernelRenderPixels<<<gridDim, blockDim>>>();
+    } else {
+        kernelRenderPixelsIterative<<<gridDim, blockDim>>>();
+    }
     cudaDeviceSynchronize();
 }
